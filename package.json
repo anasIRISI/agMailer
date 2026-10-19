@@ -1,0 +1,11 @@
+{
+  "name": "pfe-mail-agent",
+  "private": true,
+  "scarfSettings": {"enabled": false},
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "npm --prefix frontend run dev",
+    "build": "npm --prefix frontend run build",
+    "check": "npm --prefix frontend run check"
+  }
+}
