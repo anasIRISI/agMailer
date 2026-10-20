@@ -6,18 +6,18 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from fastapi.responses import FileResponse, Response
 from fastapi.security import APIKeyHeader
-from sqlalchemy import select, func
+from sqlalchemy import select, func, update, delete
 from sqlalchemy.orm import Session
-from pypdf import PdfReader
 from app.core.config import DATA_DIR, MAX_PDF, MAX_ATTACHMENTS
 from app.database.session import get_db, now
 from app.models.entities import Recipient, Document, Template, Campaign, Delivery, Setting
-from app.schemas.api import RecipientInput, TemplateInput, CampaignInput, PreviewInput, ActionInput, SettingsInput
+from app.schemas.api import RecipientInput, RecipientExclusionInput, RecipientBulkDeleteInput, TemplateInput, CampaignInput, PreviewInput, ActionInput, SettingsInput
 from app.repositories.queries import as_dict, contacted
 from app.services.importing import import_recipients
 from app.services.rendering import render
 from app.services.gmail import gmail
 from app.services.queue import SEND_LOCK, used_today, settings, day_start
+from app.services.pdf_validation import validate_pdf, PDFValidationError
 
 router = APIRouter(prefix='/api', dependencies=[Depends(APIKeyHeader(name='X-PFE-Client', auto_error=False))])
 DB = Depends(get_db)
@@ -54,6 +54,21 @@ def add_recipient(data: RecipientInput, db: Session = DB):
     db.commit()
     return as_dict(item)
 
+@router.patch('/recipients/exclusions')
+def update_exclusions(data: RecipientExclusionInput, db: Session = DB):
+    with SEND_LOCK:
+        ids = set(data.recipient_ids)
+        items = list(db.scalars(select(Recipient).where(Recipient.id.in_(ids))))
+        if len(items) != len(ids):
+            raise HTTPException(404, 'Un destinataire sélectionné est introuvable. Actualisez la liste avant de réessayer.')
+        updated = 0
+        for item in items:
+            if item.excluded != data.excluded:
+                item.excluded = data.excluded
+                updated += 1
+        db.commit()
+        return {'updated': updated, 'excluded': data.excluded}
+
 @router.put('/recipients/{id_}')
 def edit_recipient(id_: int, data: RecipientInput, db: Session = DB):
     item = require(db, Recipient, id_)
@@ -68,15 +83,32 @@ def edit_recipient(id_: int, data: RecipientInput, db: Session = DB):
     db.commit()
     return as_dict(item)
 
+def remove_contacts(db, items):
+    ids = [item.id for item in items]
+    if any(item.excluded for item in items):
+        raise HTTPException(400, 'Certains contacts sont dans la liste d’exclusion permanente. Retirez d’abord leur exclusion avant de les supprimer.')
+    db.execute(update(Delivery).where(Delivery.recipient_id.in_(ids), Delivery.status.in_(['draft', 'pending'])).values(
+        status='cancelled', error='Destinataire supprimé avant l’envoi.'))
+    db.execute(update(Delivery).where(Delivery.recipient_id.in_(ids)).values(recipient_id=None))
+    db.execute(delete(Recipient).where(Recipient.id.in_(ids)))
+    db.commit()
+
+@router.post('/recipients/bulk-delete')
+def delete_contacts(data: RecipientBulkDeleteInput, db: Session = DB):
+    if not data.confirm:
+        raise HTTPException(400, 'Confirmez la suppression des destinataires sélectionnés.')
+    with SEND_LOCK:
+        ids = set(data.recipient_ids)
+        items = list(db.scalars(select(Recipient).where(Recipient.id.in_(ids))))
+        if len(items) != len(ids):
+            raise HTTPException(404, 'Un destinataire sélectionné est introuvable. Actualisez la liste avant de réessayer.')
+        remove_contacts(db, items)
+        return {'deleted': len(items)}
+
 @router.delete('/recipients/{id_}')
 def delete_recipient(id_: int, db: Session = DB):
-    item = require(db, Recipient, id_)
-    if item.excluded:
-        raise HTTPException(400, 'Cette adresse est conservée dans la liste d’exclusion. Retirez d’abord son exclusion.')
-    for delivery in db.scalars(select(Delivery).where(Delivery.recipient_id == id_)):
-        delivery.recipient_id = None
-    db.delete(item)
-    db.commit()
+    with SEND_LOCK:
+        remove_contacts(db, [require(db, Recipient, id_)])
     return {'ok': True}
 
 @router.post('/recipients/import')
@@ -102,18 +134,9 @@ async def upload_document(file: UploadFile = File(...), kind: str = Form('cv'), 
     if len(content) > MAX_PDF or not content.startswith(b'%PDF-') or not (file.filename or '').lower().endswith('.pdf'):
         raise HTTPException(400, 'Utilisez un PDF valide de 8 Mo maximum.')
     try:
-        reader = PdfReader(io.BytesIO(content), strict=True)
-        if reader.is_encrypted or not len(reader.pages):
-            raise ValueError()
-        # Embedded actions can execute in some external PDF viewers.
-        root = reader.trailer['/Root']
-        names = root.get('/Names', {})
-        if hasattr(names, 'get_object'):
-            names = names.get_object()
-        if any(key in root for key in ['/OpenAction', '/AA']) or '/JavaScript' in names:
-            raise ValueError()
-    except Exception:
-        raise HTTPException(400, 'PDF endommagé, chiffré ou contenant une action active.') from None
+        validate_pdf(content)
+    except PDFValidationError as exc:
+        raise HTTPException(400, str(exc)) from None
     storage = f'{uuid4().hex}.pdf'
     folder = DATA_DIR / 'documents'
     folder.mkdir(parents=True, exist_ok=True)

@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, field_validator, ConfigDict
+from pydantic import BaseModel, Field, field_validator, ConfigDict, PositiveInt
 from email_validator import validate_email, EmailNotValidError
 
 def clean_email(value: str) -> str:
@@ -30,6 +30,16 @@ class TemplateInput(BaseModel):
         if '\r' in value or '\n' in value:
             raise ValueError('L’objet doit tenir sur une ligne.')
         return value
+
+class RecipientExclusionInput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    recipient_ids: list[PositiveInt] = Field(min_length=1, max_length=10000)
+    excluded: bool
+
+class RecipientBulkDeleteInput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    recipient_ids: list[PositiveInt] = Field(min_length=1, max_length=10000)
+    confirm: bool = False
 
 class CampaignInput(TemplateInput):
     recipient_ids: list[int] = Field(min_length=1, max_length=10000)
